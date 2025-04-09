@@ -21,6 +21,8 @@ typedef enum {
     ERR_GENERIC = -1
 } error_t;
 
+#define ERR_EXIT(err) do { printf("ERROR: %s\n", strerror(errno)); exit(err); } while (0);
+
 error_t get_counter(uint8_t counter[BLOCK_SIZE], const uint8_t nonce[NONCE_SIZE], const uint32_t round) {
     // Copy the original nonce into the counter
     // In our implementation, BLOCK_SIZE == NONCE_SIZE so this is safe

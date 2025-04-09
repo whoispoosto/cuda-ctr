@@ -12,7 +12,7 @@ SRCS = $(wildcard $(SRC_DIR)/*.c)
 OBJS = $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SRCS))
 
 # Target executable
-TARGET = sequential
+TARGET = main
 
 # Default rule
 all: create_dirs $(TARGET)
