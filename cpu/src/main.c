@@ -1,6 +1,12 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <errno.h>
 #include "aes.h"
 
 // AES-128-ctr
@@ -16,12 +22,15 @@
 #define BLOCK_SIZE 16           // 128-bit, regardless of key size
 #define INPUT_SIZE_BLOCKS 2     // input size in blocks
 
+#define ERRNO_EXIT(err) do { printf("ERROR: %s\n", strerror(errno)); exit(err); } while (0);
+#define RET(err, str, ...) do { printf("ERROR: " str "\n",  ##__VA_ARGS__); exit(err); } while (0);
+
 typedef enum {
     SUCCESS = 0,
-    ERR_GENERIC = -1
+    ERR_GENERIC = -1,
+    ERR_FORK = -2,
+    ERR_MMAP = -3
 } error_t;
-
-#define ERR_EXIT(err) do { printf("ERROR: %s\n", strerror(errno)); exit(err); } while (0);
 
 error_t get_counter(uint8_t counter[BLOCK_SIZE], const uint8_t nonce[NONCE_SIZE], const uint32_t round) {
     // Copy the original nonce into the counter
@@ -31,10 +40,13 @@ error_t get_counter(uint8_t counter[BLOCK_SIZE], const uint8_t nonce[NONCE_SIZE]
 
     // Handle incrementing for the round
     int32_t b = BLOCK_SIZE - 1;
-    uint8_t carry = round;
-    
-    uint32_t prev_counter;
 
+    // TODO: output works, but counters are repeating (security risk)
+    // change this to 32-bit
+    uint8_t carry = round;
+    uint8_t prev_counter;
+
+    
     while (b >= 0) {
         prev_counter = counter[b]; 
         counter[b] += carry;
@@ -48,7 +60,7 @@ error_t get_counter(uint8_t counter[BLOCK_SIZE], const uint8_t nonce[NONCE_SIZE]
 
         // If overflow does occur, we need to handle wrap-around
         // Simply set carry to 1
-        // The current position will naturally wrap-around properly
+        // The current position will naturally wrap-around properly with the arithmetic
         carry = 1;
         --b;
     }
@@ -96,8 +108,21 @@ int main() {
         0x0c, 0x0d, 0x0e, 0x0f
     };
 
+    // Create a block of memory
+#ifdef PARALLEL
+    printf("parallel on!\n");
+
+    uint8_t *output = (uint8_t *)mmap(NULL, sizeof(INPUT_SIZE_BLOCKS * BLOCK_SIZE), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+
+    if (output == MAP_FAILED) {
+        RET(ERR_MMAP, "mmap failed");
+    }
+
+    pid_t pid;
+#else
     uint8_t output[INPUT_SIZE_BLOCKS * BLOCK_SIZE];
-    
+#endif
+
     uint8_t counter[BLOCK_SIZE];
     uint8_t counter_encrypted[BLOCK_SIZE];
 
@@ -108,10 +133,23 @@ int main() {
 
     // Iterate over every block in the input
     for (uint32_t i = 0; i < INPUT_SIZE_BLOCKS; ++i) {
+#ifdef PARALLEL
+        pid = fork();
+
+        // Check if fork() succeeded
+        if (pid == -1) {
+            RET(ERR_FORK, "fork failed");
+        }
+
+        // If parent task, don't do the actual work of the loop
+        if (pid != 0) {
+            continue;
+        }
+#endif
+
         // Get the current counter
         if ((err = get_counter(counter, nonce, i)) != SUCCESS) {
-            printf("get_counter() failed\n");
-            return err;
+            RET(err, "get_counter failed");
         };
 
         // Get a pointer to the current input and output blocks
@@ -120,15 +158,25 @@ int main() {
 
         // Run AES algorithm on the current counter
         if ((err = aes(counter_encrypted, counter, round_key)) != SUCCESS) {
-            printf("aes_ctr() failed\n");
-            return err;
+            RET(err, "aes_ctr failed");
         }
 
         // XOR the AES-encrypted counter with the plaintext input
         for (uint32_t b = 0; b < BLOCK_SIZE; ++b) {
             block_out[b] = block_in[b] ^ counter_encrypted[b];
         }
+
+#ifdef PARALLEL
+        // Exit the child after execution is complete
+        _exit(0);
+#endif
     }
+
+#ifdef PARALLEL
+    for (uint32_t i = 0; i < INPUT_SIZE_BLOCKS; ++i) {
+        wait(NULL);
+    }
+#endif
 
     // DEBUG: Print out the encrypted block
     for (uint32_t i = 0; i < INPUT_SIZE_BLOCKS; ++i) {
@@ -140,6 +188,12 @@ int main() {
 
         printf("\n");
     }
+
+#ifdef PARALLEL
+    if (munmap(output, INPUT_SIZE_BLOCKS * BLOCK_SIZE) == -1) {
+        RET(ERR_MMAP, "munmap failed");
+    }
+#endif
 
     return SUCCESS;
 }
