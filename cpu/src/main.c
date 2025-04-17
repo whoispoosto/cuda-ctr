@@ -40,10 +40,13 @@ error_t get_counter(uint8_t counter[BLOCK_SIZE], const uint8_t nonce[NONCE_SIZE]
 
     // Handle incrementing for the round
     int32_t b = BLOCK_SIZE - 1;
-    uint8_t carry = round;
-    
-    uint32_t prev_counter;
 
+    // TODO: output works, but counters are repeating (security risk)
+    // change this to 32-bit
+    uint8_t carry = round;
+    uint8_t prev_counter;
+
+    
     while (b >= 0) {
         prev_counter = counter[b]; 
         counter[b] += carry;
@@ -57,7 +60,7 @@ error_t get_counter(uint8_t counter[BLOCK_SIZE], const uint8_t nonce[NONCE_SIZE]
 
         // If overflow does occur, we need to handle wrap-around
         // Simply set carry to 1
-        // The current position will naturally wrap-around properly
+        // The current position will naturally wrap-around properly with the arithmetic
         carry = 1;
         --b;
     }
