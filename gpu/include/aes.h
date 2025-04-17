@@ -90,6 +90,6 @@ void AES_CTR_xcrypt_buffer(struct AES_ctx* ctx, uint8_t* buf, size_t length);
 typedef uint8_t state_t[4][4];
 
 void KeyExpansion(uint8_t* RoundKey, const uint8_t* Key);
-// void Cipher(state_t* state, const uint8_t* RoundKey);
+void Cipher(state_t* state, const uint8_t* RoundKey);
 
 #endif // _AES_H_
