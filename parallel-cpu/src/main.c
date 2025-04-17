@@ -22,7 +22,8 @@
 #define BLOCK_SIZE 16           // 128-bit, regardless of key size
 #define INPUT_SIZE_BLOCKS 2     // input size in blocks
 
-#define ERR_EXIT(err) do { printf("ERROR: %s\n", strerror(errno)); exit(err); } while (0);
+#define ERRNO_EXIT(err) do { printf("ERROR: %s\n", strerror(errno)); exit(err); } while (0);
+#define RET(err, str, ...) do { printf("ERROR: " str "\n",  ##__VA_ARGS__); exit(err); } while (0);
 
 typedef enum {
     SUCCESS = 0,
@@ -104,12 +105,20 @@ int main() {
         0x0c, 0x0d, 0x0e, 0x0f
     };
 
-    // Create a block of shared memory
+    // Create a block of memory
+#ifdef PARALLEL
+    printf("parallel on!\n");
+
     uint8_t *output = (uint8_t *)mmap(NULL, sizeof(INPUT_SIZE_BLOCKS * BLOCK_SIZE), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
 
     if (output == MAP_FAILED) {
-        ERR_EXIT(ERR_MMAP);
+        RET(ERR_MMAP, "mmap failed");
     }
+
+    pid_t pid;
+#else
+    uint8_t output[INPUT_SIZE_BLOCKS * BLOCK_SIZE];
+#endif
 
     uint8_t counter[BLOCK_SIZE];
     uint8_t counter_encrypted[BLOCK_SIZE];
@@ -118,26 +127,26 @@ int main() {
     const uint8_t *block_in;
 
     error_t err;
-    pid_t pid;
 
     // Iterate over every block in the input
     for (uint32_t i = 0; i < INPUT_SIZE_BLOCKS; ++i) {
+#ifdef PARALLEL
         pid = fork();
 
         // Check if fork() succeeded
         if (pid == -1) {
-            ERR_EXIT(ERR_FORK);
+            RET(ERR_FORK, "fork failed");
         }
 
         // If parent task, don't do the actual work of the loop
         if (pid != 0) {
             continue;
         }
+#endif
 
         // Get the current counter
         if ((err = get_counter(counter, nonce, i)) != SUCCESS) {
-            printf("get_counter() failed\n");
-            return err;
+            RET(err, "get_counter failed");
         };
 
         // Get a pointer to the current input and output blocks
@@ -146,8 +155,7 @@ int main() {
 
         // Run AES algorithm on the current counter
         if ((err = aes(counter_encrypted, counter, round_key)) != SUCCESS) {
-            printf("aes_ctr() failed\n");
-            return err;
+            RET(err, "aes_ctr failed");
         }
 
         // XOR the AES-encrypted counter with the plaintext input
@@ -155,13 +163,17 @@ int main() {
             block_out[b] = block_in[b] ^ counter_encrypted[b];
         }
 
+#ifdef PARALLEL
         // Exit the child after execution is complete
         _exit(0);
+#endif
     }
 
+#ifdef PARALLEL
     for (uint32_t i = 0; i < INPUT_SIZE_BLOCKS; ++i) {
         wait(NULL);
     }
+#endif
 
     // DEBUG: Print out the encrypted block
     for (uint32_t i = 0; i < INPUT_SIZE_BLOCKS; ++i) {
@@ -174,9 +186,11 @@ int main() {
         printf("\n");
     }
 
+#ifdef PARALLEL
     if (munmap(output, INPUT_SIZE_BLOCKS * BLOCK_SIZE) == -1) {
-        ERR_EXIT(ERR_MMAP);
+        RET(ERR_MMAP, "munmap failed");
     }
+#endif
 
     return SUCCESS;
 }
