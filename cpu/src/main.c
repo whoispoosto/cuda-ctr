@@ -20,16 +20,23 @@
 #define KEY_SIZE 16             // 128-bit
 #define NONCE_SIZE 16           // 128-bit, aka initialization vector (IV) -- some implementations do 64-bit
 #define BLOCK_SIZE 16           // 128-bit, regardless of key size
-#define INPUT_SIZE_BLOCKS 2     // input size in blocks
 
 #define ERRNO_EXIT(err) do { printf("ERROR: %s\n", strerror(errno)); exit(err); } while (0);
 #define RET(err, str, ...) do { printf("ERROR: " str "\n",  ##__VA_ARGS__); exit(err); } while (0);
+
+#define NUM_ARGS 2
+#define ARG_PROGNAME 0
+#define ARG_FILENAME 1
+
+#define BUFFER_SIZE 1024 * 1024 * 100 // 100 MB
 
 typedef enum {
     SUCCESS = 0,
     ERR_GENERIC = -1,
     ERR_FORK = -2,
-    ERR_MMAP = -3
+    ERR_MMAP = -3,
+    ERR_USAGE = -4,
+    ERR_FILE = -5
 } error_t;
 
 error_t get_counter(uint8_t counter[BLOCK_SIZE], const uint8_t nonce[NONCE_SIZE], const uint32_t round) {
@@ -46,7 +53,6 @@ error_t get_counter(uint8_t counter[BLOCK_SIZE], const uint8_t nonce[NONCE_SIZE]
     uint8_t carry = round;
     uint8_t prev_counter;
 
-    
     while (b >= 0) {
         prev_counter = counter[b]; 
         counter[b] += carry;
@@ -79,7 +85,31 @@ error_t aes(uint8_t output[BLOCK_SIZE], const uint8_t counter[BLOCK_SIZE], const
     return SUCCESS;
 }
 
-int main() {
+int main(int argc, char **argv) {
+    if (argc < NUM_ARGS) {
+        RET(ERR_USAGE, "Program usage: %s [filename]", argv[ARG_PROGNAME]);
+    }
+
+    // Open the input file for reading
+    FILE *inputstream = fopen(argv[ARG_FILENAME], "r");
+
+    if (inputstream == NULL) {
+        RET(ERR_FILE, "Unable to open input file");
+    }
+
+    // Create a buffer to read file contents into
+    uint8_t *input = malloc(BUFFER_SIZE);
+    memset(input, 0, BUFFER_SIZE);
+
+    // Read the contents of the file into a buffer
+    fread(input, 1, BUFFER_SIZE, inputstream);
+
+    if (ferror(inputstream)) {
+        RET(ERR_FILE, "Unable to read input file");
+    }
+
+    fclose(inputstream);
+
     const uint8_t key[KEY_SIZE] = {
         0x2b, 0x7e, 0x15, 0x16,
         0x28, 0xae, 0xd2, 0xa6,
@@ -97,22 +127,16 @@ int main() {
         0x0c, 0x0d, 0x0e, 0x0f
     };
 
-    const uint8_t input[INPUT_SIZE_BLOCKS * BLOCK_SIZE] = {
-        0x6b, 0xc1, 0xbe, 0xe2,
-        0x2e, 0x40, 0x9f, 0x96,
-        0xe9, 0x3d, 0x7e, 0x11,
-        0x73, 0x93, 0x17, 0x2a,
-        0x00, 0x01, 0x02, 0x03,
-        0x04, 0x05, 0x06, 0x07,
-        0x08, 0x09, 0x0a, 0x0b,
-        0x0c, 0x0d, 0x0e, 0x0f
-    };
+    // Calculated the input size in blocks, rounded up
+    const uint32_t input_size_blocks = (BUFFER_SIZE + (BLOCK_SIZE - 1)) / BLOCK_SIZE;
+    const uint32_t output_size = input_size_blocks * BLOCK_SIZE;
 
     // Create a block of memory
+    // TODO: fix parallel
 #ifdef PARALLEL
     printf("parallel on!\n");
 
-    uint8_t *output = (uint8_t *)mmap(NULL, sizeof(INPUT_SIZE_BLOCKS * BLOCK_SIZE), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    uint8_t *output = (uint8_t *)mmap(NULL, sizeof(input_size_blocks * BLOCK_SIZE), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
 
     if (output == MAP_FAILED) {
         RET(ERR_MMAP, "mmap failed");
@@ -120,7 +144,8 @@ int main() {
 
     pid_t pid;
 #else
-    uint8_t output[INPUT_SIZE_BLOCKS * BLOCK_SIZE];
+    uint8_t *output = malloc(output_size);
+    memset(output, 0, output_size);
 #endif
 
     uint8_t counter[BLOCK_SIZE];
@@ -132,7 +157,7 @@ int main() {
     error_t err;
 
     // Iterate over every block in the input
-    for (uint32_t i = 0; i < INPUT_SIZE_BLOCKS; ++i) {
+    for (uint32_t i = 0; i < input_size_blocks; ++i) {
 #ifdef PARALLEL
         pid = fork();
 
@@ -173,13 +198,13 @@ int main() {
     }
 
 #ifdef PARALLEL
-    for (uint32_t i = 0; i < INPUT_SIZE_BLOCKS; ++i) {
+    for (uint32_t i = 0; i < input_size_blocks; ++i) {
         wait(NULL);
     }
 #endif
 
     // DEBUG: Print out the encrypted block
-    for (uint32_t i = 0; i < INPUT_SIZE_BLOCKS; ++i) {
+    /*for (uint32_t i = 0; i < input_size_blocks; ++i) {
         uint8_t *block_out = &output[i * BLOCK_SIZE];
 
         for (uint32_t b = 0; b < BLOCK_SIZE; ++b) {
@@ -187,13 +212,33 @@ int main() {
         }
 
         printf("\n");
+    }*/
+
+    // Open an output file for writing
+    FILE *outputstream = fopen("output", "w");
+
+    if (outputstream == NULL) {
+        RET(ERR_FILE, "Unable to open input file");
     }
 
+    // Write the contents of the output to the stream
+    fwrite(output, 1, output_size, outputstream); 
+
+    if (ferror(outputstream)) {
+        RET(ERR_FILE, "Unable to read input file");
+    }
+
+    fclose(outputstream);
+
 #ifdef PARALLEL
-    if (munmap(output, INPUT_SIZE_BLOCKS * BLOCK_SIZE) == -1) {
+    if (munmap(output, input_size_blocks * BLOCK_SIZE) == -1) {
         RET(ERR_MMAP, "munmap failed");
     }
 #endif
+
+    // Free memory
+    free(input);
+    free(output);
 
     return SUCCESS;
 }
