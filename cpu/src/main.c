@@ -7,6 +7,8 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
+
 #include "aes.h"
 
 // AES-128-ctr
@@ -29,6 +31,8 @@
 #define ARG_FILENAME 1
 
 #define BUFFER_SIZE 1024 * 1024 * 100 // 100 MB
+
+#define COARSENING_FACTOR (BLOCK_SIZE * 256) // Must be a multiple of block size
 
 typedef enum {
     SUCCESS = 0,
@@ -132,11 +136,10 @@ int main(int argc, char **argv) {
     const uint32_t output_size = input_size_blocks * BLOCK_SIZE;
 
     // Create a block of memory
-    // TODO: fix parallel
 #ifdef PARALLEL
     printf("parallel on!\n");
 
-    uint8_t *output = (uint8_t *)mmap(NULL, sizeof(input_size_blocks * BLOCK_SIZE), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    uint8_t *output = (uint8_t *)mmap(NULL, output_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
 
     if (output == MAP_FAILED) {
         RET(ERR_MMAP, "mmap failed");
@@ -156,8 +159,11 @@ int main(int argc, char **argv) {
 
     error_t err;
 
+    printf("Starting timer...\n");
+    clock_t start = clock();
+
     // Iterate over every block in the input
-    for (uint32_t i = 0; i < input_size_blocks; ++i) {
+    for (uint32_t i = 0; i < input_size_blocks; i += COARSENING_FACTOR) {
 #ifdef PARALLEL
         pid = fork();
 
@@ -172,23 +178,25 @@ int main(int argc, char **argv) {
         }
 #endif
 
-        // Get the current counter
-        if ((err = get_counter(counter, nonce, i)) != SUCCESS) {
-            RET(err, "get_counter failed");
-        };
+        for (uint32_t block = i; block < i + COARSENING_FACTOR && block < input_size_blocks; ++block) {
+            // Get the current counter
+            if ((err = get_counter(counter, nonce, block)) != SUCCESS) {
+                RET(err, "get_counter failed");
+            }
 
-        // Get a pointer to the current input and output blocks
-        block_out = &output[i * BLOCK_SIZE];
-        block_in = &input[i * BLOCK_SIZE];
+            // Get a pointer to the current input and output blocks
+            block_out = &output[block * BLOCK_SIZE];
+            block_in = &input[block * BLOCK_SIZE];
 
-        // Run AES algorithm on the current counter
-        if ((err = aes(counter_encrypted, counter, round_key)) != SUCCESS) {
-            RET(err, "aes_ctr failed");
-        }
+            // Run AES algorithm on the current counter
+            if ((err = aes(counter_encrypted, counter, round_key)) != SUCCESS) {
+                RET(err, "aes_ctr failed");
+            }
 
-        // XOR the AES-encrypted counter with the plaintext input
-        for (uint32_t b = 0; b < BLOCK_SIZE; ++b) {
-            block_out[b] = block_in[b] ^ counter_encrypted[b];
+            // XOR the AES-encrypted counter with the plaintext input
+            for (uint32_t b = 0; b < BLOCK_SIZE; ++b) {
+                block_out[b] = block_in[b] ^ counter_encrypted[b];
+            }
         }
 
 #ifdef PARALLEL
@@ -214,6 +222,11 @@ int main(int argc, char **argv) {
         printf("\n");
     }*/
 
+    printf("Stopping timer...\n");
+    clock_t stop = clock();
+
+    printf("Timer done! Elapsed time: %.4f secs\n", (double)(stop - start) / CLOCKS_PER_SEC);
+
     // Open an output file for writing
     FILE *outputstream = fopen("output", "w");
 
@@ -230,15 +243,17 @@ int main(int argc, char **argv) {
 
     fclose(outputstream);
 
+    // Free input memory
+    free(input);
+
+    // Free output memory
 #ifdef PARALLEL
-    if (munmap(output, input_size_blocks * BLOCK_SIZE) == -1) {
+    if (munmap(output, output_size) == -1) {
         RET(ERR_MMAP, "munmap failed");
     }
-#endif
-
-    // Free memory
-    free(input);
+#else
     free(output);
+#endif
 
     return SUCCESS;
 }
