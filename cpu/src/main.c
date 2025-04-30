@@ -26,11 +26,13 @@
 #define ERRNO_EXIT(err) do { printf("ERROR: %s\n", strerror(errno)); exit(err); } while (0);
 #define RET(err, str, ...) do { printf("ERROR: " str "\n",  ##__VA_ARGS__); exit(err); } while (0);
 
-#define NUM_ARGS 2
+#define NUM_ARGS 3
 #define ARG_PROGNAME 0
-#define ARG_FILENAME 1
+#define ARG_INFILENAME 1
+#define ARG_OUTFILENAME 2
 
-#define BUFFER_SIZE 1024 * 1024 * 100 // 100 MB
+#define MB (1024 * 1024)
+#define BUFFER_SIZE ((MB * 2047) - 1 + MB) // Max input size (stored on heap). This weird expression prevents overflow
 
 #define COARSENING_FACTOR (BLOCK_SIZE * 256) // Must be a multiple of block size
 
@@ -91,11 +93,11 @@ error_t aes(uint8_t output[BLOCK_SIZE], const uint8_t counter[BLOCK_SIZE], const
 
 int main(int argc, char **argv) {
     if (argc < NUM_ARGS) {
-        RET(ERR_USAGE, "Program usage: %s [filename]", argv[ARG_PROGNAME]);
+        RET(ERR_USAGE, "Program usage: %s [input filename] [output filename]", argv[ARG_PROGNAME]);
     }
 
     // Open the input file for reading
-    FILE *inputstream = fopen(argv[ARG_FILENAME], "r");
+    FILE *inputstream = fopen(argv[ARG_INFILENAME], "r");
 
     if (inputstream == NULL) {
         RET(ERR_FILE, "Unable to open input file");
@@ -106,7 +108,8 @@ int main(int argc, char **argv) {
     memset(input, 0, BUFFER_SIZE);
 
     // Read the contents of the file into a buffer
-    fread(input, 1, BUFFER_SIZE, inputstream);
+    size_t filesize = fread(input, 1, BUFFER_SIZE, inputstream);
+    printf("Input file size: %lu MB\n", filesize / MB);
 
     if (ferror(inputstream)) {
         RET(ERR_FILE, "Unable to read input file");
@@ -132,7 +135,7 @@ int main(int argc, char **argv) {
     };
 
     // Calculated the input size in blocks, rounded up
-    const uint32_t input_size_blocks = (BUFFER_SIZE + (BLOCK_SIZE - 1)) / BLOCK_SIZE;
+    const uint32_t input_size_blocks = (filesize + (BLOCK_SIZE - 1)) / BLOCK_SIZE;
     const uint32_t output_size = input_size_blocks * BLOCK_SIZE;
 
     // Create a block of memory
@@ -228,7 +231,7 @@ int main(int argc, char **argv) {
     printf("Timer done! Elapsed time: %.4f secs\n", (double)(stop - start) / CLOCKS_PER_SEC);
 
     // Open an output file for writing
-    FILE *outputstream = fopen("output", "w");
+    FILE *outputstream = fopen(argv[ARG_OUTFILENAME], "w");
 
     if (outputstream == NULL) {
         RET(ERR_FILE, "Unable to open input file");
