@@ -125,6 +125,7 @@ static void aes_work(task_data_t *tdata) {
     // Store an error variable for error-handling later
     error_t err;
 
+    // Iterate over every block in range [offset, offset + COARSENING_FACTOR)
     for (uint32_t block = offset; block < offset + COARSENING_FACTOR && block < input_size_blocks; ++block) {
         // Get the current counter
         if ((err = get_counter(counter, nonce, block)) != SUCCESS) {
@@ -180,10 +181,6 @@ int main(int argc, char **argv) {
 
     fclose(inputstream);
 
-#ifdef PARALLEL
-    printf("Parallel mode on!\n");
-#endif
-
     // Store key data (arbitrary)
     const uint8_t key[KEY_SIZE] = {
         0x2b, 0x7e, 0x15, 0x16,
@@ -207,15 +204,16 @@ int main(int argc, char **argv) {
     // Calculate the number of threads
     uint32_t num_threads = (input_size_blocks + (COARSENING_FACTOR - 1)) / COARSENING_FACTOR;
 
-    printf("Input size (blocks): %u\n", input_size_blocks);
-    printf("Coarsening factor: %u\n", COARSENING_FACTOR);
-    printf("Number of threads: %u\n", num_threads);
-
     // Store structs for each thread task
     task_data_t tdata[num_threads];
 
 #ifdef PARALLEL
-    // Create an array of threads
+    printf("Parallel mode on!\n\n");
+    printf("Input size (blocks): %u\n", input_size_blocks);
+    printf("Coarsening factor: %u\n", COARSENING_FACTOR);
+    printf("Number of threads: %u\n\n", num_threads);
+
+    // Create an array of threads and store an index for the current thread
     pthread_t threads[num_threads];
     uint32_t curr_thread = 0;
 #endif
@@ -226,9 +224,10 @@ int main(int argc, char **argv) {
     // Iterate over every block in the input
     uint32_t iteration = 0;
     for (uint32_t i = 0; i < input_size_blocks; i += COARSENING_FACTOR, ++iteration) {
+        // Grab the current thread data struct
         task_data_t *curr_tdata = &tdata[iteration];
 
-        // Store the current iteration
+        // Store the current block offset
         curr_tdata->offset = i;
 
 #ifdef PARALLEL
@@ -240,6 +239,9 @@ int main(int argc, char **argv) {
         // Increment the current thread index
         ++curr_thread;
 #else
+        // Run the AES work sequentially if not in parallel mode
+        // Even though this work is all run on a single thread,
+        // we use the thread data struct for simplicity.
         aes_work(curr_tdata); 
 #endif
     }
@@ -259,7 +261,7 @@ int main(int argc, char **argv) {
     FILE *outputstream = fopen(argv[ARG_OUTFILENAME], "w");
 
     if (outputstream == NULL) {
-        RET(ERR_FILE, "Unable to open input file");
+        RET(ERR_FILE, "Unable to open output file");
     }
 
     // Write the contents of the output to the stream

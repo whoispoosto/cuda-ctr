@@ -2,7 +2,7 @@
 
 INDIR=./inputs
 OUTDIR=./outputs
-MODE="sequential"
+MODE="parallel"
 
 MB=1024*1024
 
