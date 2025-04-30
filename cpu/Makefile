@@ -1,6 +1,6 @@
 # Compiler and flags
 CC = gcc
-CFLAGS = -Wall -Wextra -Iinclude -DCBC=0 -DECB=0 -DCTR=1
+CFLAGS = -Wall -Wextra -Iinclude -DCBC=0 -DECB=0 -DCTR=1 -g
 PARALLEL_FLAG = -DPARALLEL
 
 # Directories

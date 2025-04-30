@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
+#include <pthread.h>
 
 #include "aes.h"
 
@@ -34,7 +35,7 @@
 #define MB (1024 * 1024)
 #define BUFFER_SIZE ((MB * 2047) - 1 + MB) // Max input size (stored on heap). This weird expression prevents overflow
 
-#define COARSENING_FACTOR (BLOCK_SIZE * 256) // Must be a multiple of block size
+#define COARSENING_FACTOR 1024
 
 typedef enum {
     SUCCESS = 0,
@@ -44,6 +45,24 @@ typedef enum {
     ERR_USAGE = -4,
     ERR_FILE = -5
 } error_t;
+
+static uint8_t *input;
+static uint8_t *output;
+
+static const uint8_t nonce[NONCE_SIZE] = {
+    0x00, 0x01, 0x02, 0x03,
+    0x04, 0x05, 0x06, 0x07,
+    0x08, 0x09, 0x0a, 0x0b,
+    0x0c, 0x0d, 0x0e, 0x0f
+};
+
+static uint8_t round_key[AES_keyExpSize];
+
+static uint32_t input_size_blocks;
+
+typedef struct {
+    uint32_t offset;
+} task_data_t;
 
 error_t get_counter(uint8_t counter[BLOCK_SIZE], const uint8_t nonce[NONCE_SIZE], const uint32_t round) {
     // Copy the original nonce into the counter
@@ -91,6 +110,50 @@ error_t aes(uint8_t output[BLOCK_SIZE], const uint8_t counter[BLOCK_SIZE], const
     return SUCCESS;
 }
 
+static void aes_work(task_data_t *tdata) {
+    // Extract info from argument
+    uint32_t offset = tdata->offset;
+
+    // Store pointers to the in and out blocks
+    const uint8_t *block_in;
+    uint8_t *block_out;
+
+    // Store buffers for the counter and encrypted counter
+    uint8_t counter[BLOCK_SIZE];
+    uint8_t counter_encrypted[BLOCK_SIZE];
+
+    // Store an error variable for error-handling later
+    error_t err;
+
+    for (uint32_t block = offset; block < offset + COARSENING_FACTOR && block < input_size_blocks; ++block) {
+        // Get the current counter
+        if ((err = get_counter(counter, nonce, block)) != SUCCESS) {
+            RET(err, "get_counter failed");
+        }
+
+        // Run AES algorithm on the current counter
+        if ((err = aes(counter_encrypted, counter, round_key)) != SUCCESS) {
+            RET(err, "aes_ctr failed");
+        }
+
+        // Get a pointer to the current input and output blocks
+        block_out = &output[block * BLOCK_SIZE];
+        block_in = &input[block * BLOCK_SIZE];
+
+        // XOR the AES-encrypted counter with the plaintext input
+        for (uint32_t b = 0; b < BLOCK_SIZE; ++b) {
+            block_out[b] = block_in[b] ^ counter_encrypted[b];
+        }
+    }
+}
+
+#ifdef PARALLEL
+static void *thread_task(void *data) {
+    aes_work(data);
+    return NULL;
+}
+#endif
+
 int main(int argc, char **argv) {
     if (argc < NUM_ARGS) {
         RET(ERR_USAGE, "Program usage: %s [input filename] [output filename]", argv[ARG_PROGNAME]);
@@ -104,7 +167,7 @@ int main(int argc, char **argv) {
     }
 
     // Create a buffer to read file contents into
-    uint8_t *input = malloc(BUFFER_SIZE);
+    input = malloc(BUFFER_SIZE);
     memset(input, 0, BUFFER_SIZE);
 
     // Read the contents of the file into a buffer
@@ -117,6 +180,11 @@ int main(int argc, char **argv) {
 
     fclose(inputstream);
 
+#ifdef PARALLEL
+    printf("Parallel mode on!\n");
+#endif
+
+    // Store key data (arbitrary)
     const uint8_t key[KEY_SIZE] = {
         0x2b, 0x7e, 0x15, 0x16,
         0x28, 0xae, 0xd2, 0xa6,
@@ -124,106 +192,63 @@ int main(int argc, char **argv) {
         0x09, 0xcf, 0x4f, 0x3c
     };
 
-    uint8_t round_key[AES_keyExpSize];
+    // Initialize round key from key data
     KeyExpansion(round_key, key);
 
-    const uint8_t nonce[NONCE_SIZE] = {
-        0x00, 0x01, 0x02, 0x03,
-        0x04, 0x05, 0x06, 0x07,
-        0x08, 0x09, 0x0a, 0x0b,
-        0x0c, 0x0d, 0x0e, 0x0f
-    };
-
     // Calculated the input size in blocks, rounded up
-    const uint32_t input_size_blocks = (filesize + (BLOCK_SIZE - 1)) / BLOCK_SIZE;
+    // Use this to calculate the output size
+    input_size_blocks = (filesize + (BLOCK_SIZE - 1)) / BLOCK_SIZE;
     const uint32_t output_size = input_size_blocks * BLOCK_SIZE;
 
-    // Create a block of memory
-#ifdef PARALLEL
-    printf("parallel on!\n");
-
-    uint8_t *output = (uint8_t *)mmap(NULL, output_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-
-    if (output == MAP_FAILED) {
-        RET(ERR_MMAP, "mmap failed");
-    }
-
-    pid_t pid;
-#else
-    uint8_t *output = malloc(output_size);
+    // Create a block of memory for output
+    output = malloc(output_size);
     memset(output, 0, output_size);
+
+    // Calculate the number of threads
+    uint32_t num_threads = (input_size_blocks + (COARSENING_FACTOR - 1)) / COARSENING_FACTOR;
+
+    printf("Input size (blocks): %u\n", input_size_blocks);
+    printf("Coarsening factor: %u\n", COARSENING_FACTOR);
+    printf("Number of threads: %u\n", num_threads);
+
+    // Store structs for each thread task
+    task_data_t tdata[num_threads];
+
+#ifdef PARALLEL
+    // Create an array of threads
+    pthread_t threads[num_threads];
+    uint32_t curr_thread = 0;
 #endif
-
-    uint8_t counter[BLOCK_SIZE];
-    uint8_t counter_encrypted[BLOCK_SIZE];
-
-    uint8_t *block_out;
-    const uint8_t *block_in;
-
-    error_t err;
 
     printf("Starting timer...\n");
     clock_t start = clock();
 
     // Iterate over every block in the input
-    for (uint32_t i = 0; i < input_size_blocks; i += COARSENING_FACTOR) {
-#ifdef PARALLEL
-        pid = fork();
+    uint32_t iteration = 0;
+    for (uint32_t i = 0; i < input_size_blocks; i += COARSENING_FACTOR, ++iteration) {
+        task_data_t *curr_tdata = &tdata[iteration];
 
-        // Check if fork() succeeded
-        if (pid == -1) {
-            RET(ERR_FORK, "fork failed");
-        }
-
-        // If parent task, don't do the actual work of the loop
-        if (pid != 0) {
-            continue;
-        }
-#endif
-
-        for (uint32_t block = i; block < i + COARSENING_FACTOR && block < input_size_blocks; ++block) {
-            // Get the current counter
-            if ((err = get_counter(counter, nonce, block)) != SUCCESS) {
-                RET(err, "get_counter failed");
-            }
-
-            // Get a pointer to the current input and output blocks
-            block_out = &output[block * BLOCK_SIZE];
-            block_in = &input[block * BLOCK_SIZE];
-
-            // Run AES algorithm on the current counter
-            if ((err = aes(counter_encrypted, counter, round_key)) != SUCCESS) {
-                RET(err, "aes_ctr failed");
-            }
-
-            // XOR the AES-encrypted counter with the plaintext input
-            for (uint32_t b = 0; b < BLOCK_SIZE; ++b) {
-                block_out[b] = block_in[b] ^ counter_encrypted[b];
-            }
-        }
+        // Store the current iteration
+        curr_tdata->offset = i;
 
 #ifdef PARALLEL
-        // Exit the child after execution is complete
-        _exit(0);
+        // Create a new thread
+        if (pthread_create(&threads[curr_thread], NULL, thread_task, curr_tdata) != 0) {
+            RET(ERR_FORK, "pthread_create failed");
+        }
+
+        // Increment the current thread index
+        ++curr_thread;
+#else
+        aes_work(curr_tdata); 
 #endif
     }
 
 #ifdef PARALLEL
-    for (uint32_t i = 0; i < input_size_blocks; ++i) {
-        wait(NULL);
+    for (uint32_t i = 0; i < num_threads; ++i) {
+        pthread_join(threads[i], NULL);
     }
 #endif
-
-    // DEBUG: Print out the encrypted block
-    /*for (uint32_t i = 0; i < input_size_blocks; ++i) {
-        uint8_t *block_out = &output[i * BLOCK_SIZE];
-
-        for (uint32_t b = 0; b < BLOCK_SIZE; ++b) {
-            printf("0x%x ", block_out[b]);
-        }
-
-        printf("\n");
-    }*/
 
     printf("Stopping timer...\n");
     clock_t stop = clock();
