@@ -49,7 +49,6 @@ __global__ void aes_ctr_kernel(
     int input_blocks
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    printf("-------------%d-------------\n", idx);
     if (idx >= input_blocks) return;
 
     uint8_t counter[BLOCK_SIZE];
@@ -62,12 +61,159 @@ __global__ void aes_ctr_kernel(
     }
 }
 
+__global__ void aes_ctr_kernel_coarsening(
+    uint8_t* output,
+    const uint8_t* input,
+    const uint8_t* round_key,
+    const uint8_t* nonce,
+    int input_blocks,
+    int blocks_per_thread
+) {
+    int global_thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int start_block = global_thread_idx * blocks_per_thread;
+
+    uint8_t counter[BLOCK_SIZE];
+
+    for (int i = 0; i < blocks_per_thread; ++i) {
+        int block_idx = start_block + i;
+        if (block_idx >= input_blocks) return;
+
+        get_counter(counter, nonce, block_idx);
+        Cipher_device((state_t*)counter, round_key);
+
+        for (int j = 0; j < BLOCK_SIZE; ++j) {
+            output[block_idx * BLOCK_SIZE + j] = 
+                input[block_idx * BLOCK_SIZE + j] ^ counter[j];
+        }
+    }
+}
+
+__global__ void aes_ctr_kernel_coalesced(
+    uint8_t* output,
+    const uint8_t* input,
+    const uint8_t* round_key,
+    const uint8_t* nonce,
+    int input_blocks,
+    int blocks_per_thread
+) {
+    int global_thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int start_block = global_thread_idx * blocks_per_thread;
+
+    alignas(16) uint8_t counter[BLOCK_SIZE]; // ensures 16-byte alignment
+
+    for (int i = 0; i < blocks_per_thread; ++i) {
+        int block_idx = start_block + i;
+        if (block_idx >= input_blocks) return;
+
+        // Generate and encrypt the counter block
+        get_counter(counter, nonce, block_idx);
+        Cipher_device((state_t*)counter, round_key);
+
+        // Cast input/output/counter to 128-bit wide types
+        const uint4* input_block = reinterpret_cast<const uint4*>(&input[block_idx * BLOCK_SIZE]);
+        uint4* output_block = reinterpret_cast<uint4*>(&output[block_idx * BLOCK_SIZE]);
+        const uint4* counter_block = reinterpret_cast<const uint4*>(counter);
+
+        // XOR the entire 16-byte block in 4 × 32-bit words
+        output_block[0].x = input_block[0].x ^ counter_block[0].x;
+        output_block[0].y = input_block[0].y ^ counter_block[0].y;
+        output_block[0].z = input_block[0].z ^ counter_block[0].z;
+        output_block[0].w = input_block[0].w ^ counter_block[0].w;
+    }
+}
+
+__global__ void aes_ctr_kernel_coarsening_shared(
+    uint8_t* output,
+    const uint8_t* input,
+    const uint8_t* round_key,
+    const uint8_t* nonce,
+    int input_blocks,
+    int blocks_per_thread
+) {
+    extern __shared__ uint8_t shared_round_key[];
+
+    // One thread per block copies round key into shared memory
+    int tid = threadIdx.x;
+    int threads_in_block = blockDim.x;
+    int total_key_size = AES_keyExpSize;
+
+    for (int i = tid; i < total_key_size; i += threads_in_block) {
+        shared_round_key[i] = round_key[i];
+    }
+    __syncthreads();  // Ensure all round key is loaded
+
+    int global_thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int start_block = global_thread_idx * blocks_per_thread;
+
+    uint8_t counter[BLOCK_SIZE];
+
+    for (int i = 0; i < blocks_per_thread; ++i) {
+        int block_idx = start_block + i;
+        if (block_idx >= input_blocks) return;
+
+        get_counter(counter, nonce, block_idx);
+        Cipher_device((state_t*)counter, shared_round_key);  // Use shared key
+
+        for (int j = 0; j < BLOCK_SIZE; ++j) {
+            output[block_idx * BLOCK_SIZE + j] = 
+                input[block_idx * BLOCK_SIZE + j] ^ counter[j];
+        }
+    }
+}
+
+__global__ void aes_ctr_kernel_coarsening_shared_coal(
+    uint8_t* output,
+    const uint8_t* input,
+    const uint8_t* round_key,
+    const uint8_t* nonce,
+    int input_blocks,
+    int blocks_per_thread
+) {
+    extern __shared__ uint8_t shared_round_key[];
+
+    // One thread per block copies round key into shared memory
+    int tid = threadIdx.x;
+    int threads_in_block = blockDim.x;
+    int total_key_size = AES_keyExpSize;
+
+    for (int i = tid; i < total_key_size; i += threads_in_block) {
+        shared_round_key[i] = round_key[i];
+    }
+    __syncthreads();  // Ensure all round key is loaded
+
+    int global_thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int start_block = global_thread_idx * blocks_per_thread;
+
+    alignas(16) uint8_t counter[BLOCK_SIZE];
+
+    for (int i = 0; i < blocks_per_thread; ++i) {
+        int block_idx = start_block + i;
+        if (block_idx >= input_blocks) return;
+
+        get_counter(counter, nonce, block_idx);
+        Cipher_device((state_t*)counter, shared_round_key);  // Use shared key
+
+        // Cast input/output/counter to 128-bit wide types
+        const uint4* input_block = reinterpret_cast<const uint4*>(&input[block_idx * BLOCK_SIZE]);
+        uint4* output_block = reinterpret_cast<uint4*>(&output[block_idx * BLOCK_SIZE]);
+        const uint4* counter_block = reinterpret_cast<const uint4*>(counter);
+
+        // XOR the entire 16-byte block in 4 × 32-bit words
+        output_block[0].x = input_block[0].x ^ counter_block[0].x;
+        output_block[0].y = input_block[0].y ^ counter_block[0].y;
+        output_block[0].z = input_block[0].z ^ counter_block[0].z;
+        output_block[0].w = input_block[0].w ^ counter_block[0].w;
+    }
+}
+
 void encrypt_aes_ctr_gpu(
     const uint8_t* input,
     const uint8_t* key,
     const uint8_t* nonce,
     uint8_t* output,
-    size_t size
+    size_t size,
+    int threads, 
+    int coarsening
 ) {
     int input_blocks = (size + BLOCK_SIZE - 1) / BLOCK_SIZE;
     uint8_t round_key[AES_keyExpSize];
@@ -84,15 +230,22 @@ void encrypt_aes_ctr_gpu(
     cudaMemcpy(d_key, round_key, AES_keyExpSize, cudaMemcpyHostToDevice);
     cudaMemcpy(d_nonce, nonce, NONCE_SIZE, cudaMemcpyHostToDevice);
 
-     // CUDA event timing
-     cudaEvent_t start, stop;
-     cudaEventCreate(&start);
-     cudaEventCreate(&stop);
-     cudaEventRecord(start);
+    // CUDA event timing
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start);
 
-    int threads = 256;
     int blocks = (input_blocks + threads - 1) / threads;
-    aes_ctr_kernel<<<blocks, threads>>>(d_output, d_input, d_key, d_nonce, input_blocks);
+    int shared_mem_bytes = AES_keyExpSize * sizeof(uint8_t);
+    // aes_ctr_kernel_coarsening_shared<<<blocks, threads, shared_mem_bytes>>>(
+        // d_output, d_input, d_key, d_nonce, input_blocks, coarsening);
+    // aes_ctr_kernel_coarsening<<<blocks, threads>>>(d_output, d_input, d_key, d_nonce, input_blocks, coarsening);
+    // aes_ctr_kernel_coalesced<<<blocks, threads>>>(d_output, d_input, d_key, d_nonce, input_blocks, coarsening);
+    // aes_ctr_kernel<<<blocks, threads>>>(d_output, d_input, d_key, d_nonce, input_blocks);
+    aes_ctr_kernel_coarsening_shared_coal<<<blocks, threads, shared_mem_bytes>>>(
+        d_output, d_input, d_key, d_nonce, input_blocks, coarsening);
+
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
 
@@ -110,10 +263,52 @@ void encrypt_aes_ctr_gpu(
     cudaEventDestroy(stop);
 }
 
+void print_gpu_info() {
+    cudaDeviceProp prop;
+    int device;
+
+    cudaGetDevice(&device);
+    cudaGetDeviceProperties(&prop, device);
+
+    printf("========== GPU Device Info ==========\n");
+    printf("Device: %s\n", prop.name);
+    printf("Total global memory: %.2f MB\n", prop.totalGlobalMem / (1024.0 * 1024.0));
+    printf("Shared memory per block: %lu bytes\n", prop.sharedMemPerBlock);
+    printf("Registers per block: %d\n", prop.regsPerBlock);
+    printf("Warp size: %d\n", prop.warpSize);
+    printf("Max threads per block: %d\n", prop.maxThreadsPerBlock);
+    printf("Max thread dimensions: [%d, %d, %d]\n", 
+           prop.maxThreadsDim[0], prop.maxThreadsDim[1], prop.maxThreadsDim[2]);
+    printf("Max grid size: [%d, %d, %d]\n", 
+           prop.maxGridSize[0], prop.maxGridSize[1], prop.maxGridSize[2]);
+    printf("Multiprocessor count: %d\n", prop.multiProcessorCount);
+    printf("Max threads per multiprocessor: %d\n", prop.maxThreadsPerMultiProcessor);
+    printf("Clock rate: %.2f MHz\n", prop.clockRate / 1000.0);
+    printf("Memory clock rate: %.2f MHz\n", prop.memoryClockRate / 1000.0);
+    printf("Memory bus width: %d bits\n", prop.memoryBusWidth);
+    printf("L2 cache size: %d bytes\n", prop.l2CacheSize);
+    printf("=====================================\n");
+}
+
 int main(int argc, char* argv[]) {
-    if (argc != 2) {
-      printf("Usage: %s <input_file>\n", argv[0]);
-      return 1;
+    // print_gpu_info();
+
+    int threads = 1024;
+    int coarsening = 2;
+
+    if (argc < 2 || argc > 4) {
+        fprintf(stderr, "Usage: %s <input_file> [threads] [coarsening]\n", argv[0]);
+        return 1;
+    }
+
+    if (argc == 3) {
+        threads = atoi(argv[2]);
+        printf("Using %d threads per block\n", threads);
+    }
+
+    if (argc == 4) {
+        coarsening = atoi(argv[3]);
+        printf("Using coarsening factor of %d\n", coarsening);
     }
 
     const char* filename = argv[1];
@@ -148,7 +343,7 @@ int main(int argc, char* argv[]) {
         0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f
     };
 
-    encrypt_aes_ctr_gpu(input, key, nonce, output, padded_size);
+    encrypt_aes_ctr_gpu(input, key, nonce, output, padded_size, threads, coarsening);
 
     char out_filename[256];
     snprintf(out_filename, sizeof(out_filename), "%s.%s", "out", "txt");
